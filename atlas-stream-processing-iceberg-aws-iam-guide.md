@@ -564,54 +564,11 @@ ASP 파이프라인에서는 다음과 같이 사용합니다.
 }
 ```
 
-## 15. KMS 권한
 
-S3 기본 암호화가 `SSE-S3`라면 별도 KMS 권한은 필요하지 않습니다.
 
-S3 기본 암호화가 고객 관리 KMS Key를 사용하는 `SSE-KMS`라면 IAM Permission Policy와 KMS Key Policy를 모두 확인해야 합니다.
 
-### 15.1 IAM Permission Policy
 
-```json
-{
-  "Sid": "UseIcebergKmsKey",
-  "Effect": "Allow",
-  "Action": [
-    "kms:Encrypt",
-    "kms:Decrypt",
-    "kms:GenerateDataKey",
-    "kms:DescribeKey"
-  ],
-  "Resource": [
-    "arn:aws:kms:ap-northeast-2:123456789012:key/<KMS-KEY-ID>"
-  ]
-}
-```
-
-### 15.2 KMS Key Policy
-
-환경에 따라 KMS Key Policy에도 고객 IAM Role을 허용해야 합니다.
-
-```json
-{
-  "Sid": "AllowAtlasIcebergWriterRole",
-  "Effect": "Allow",
-  "Principal": {
-    "AWS": "arn:aws:iam::123456789012:role/mongodb-atlas-asp-iceberg-writer"
-  },
-  "Action": [
-    "kms:Encrypt",
-    "kms:Decrypt",
-    "kms:GenerateDataKey",
-    "kms:DescribeKey"
-  ],
-  "Resource": "*"
-}
-```
-
-IAM Policy가 허용하더라도 KMS Key Policy에서 차단하면 `AccessDeniedException`이 발생합니다.
-
-## 16. S3 Bucket Policy
+## 15. S3 Bucket Policy
 
 S3 버킷과 IAM Role이 같은 AWS 계정에 있고 Bucket Policy에 별도 제한이나 명시적 Deny가 없다면 Role의 IAM Permission Policy만으로 접근할 수 있습니다.
 
