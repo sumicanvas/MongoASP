@@ -11,8 +11,9 @@
 - 기존 데이터 Initial Sync 성공
 - Insert 반영 성공
 - Update 반영 성공
-- Delete 이벤트의 Soft Delete 변환 성공
+- Delete 이벤트의 Soft Delete 변환 재검증 필요
 - Athena에서 최종 데이터 조회 성공
+- 현재 `sample_mflix_movies_v2` 테스트 데이터에서 중복 `_id` 4건 확인
 
 ## 2. 최종 구성
 
@@ -246,7 +247,6 @@ var pipelineOnly = [
               "$fullDocument",
               {
                 isDeleted: false,
-                deletedAt: null,
                 operationType: {
                   $meta: "stream.source.operationType"
                 }
@@ -294,6 +294,8 @@ var pipelineOnly = [
 ```
 
 Delete 이벤트는 데이터 필드에 `isDeleted=true`, `operationType="delete"`를 기록합니다. 동시에 `$setStreamMeta`에서 Iceberg가 실행할 CDC 작업을 `delete`가 아닌 `update`로 변경합니다. 따라서 Iceberg 행은 물리적으로 삭제되지 않고 Soft Delete 상태로 갱신됩니다.
+
+활성 문서에는 `deletedAt: null`을 강제로 추가하지 않습니다. Initial Sync의 모든 초기 값이 `null`이면 Iceberg가 컬럼 타입을 추론하지 못해 `deletedAt` 컬럼이 생성되지 않을 수 있습니다. 최초 Delete 이벤트에서 실제 Date 값과 함께 `deletedAt` 컬럼이 추가되도록 합니다.
 
 ## 8. 기존 Processor 수정
 
@@ -604,6 +606,10 @@ var softDeleteTestId = ObjectId()
 var softDeleteTestIdString = softDeleteTestId.toHexString()
 var softDeleteTestTitle = "ASP_SOFT_DELETE_" + softDeleteTestIdString
 
+if (softDeleteTestIdString.length !== 24) {
+  throw new Error("ObjectId 문자열이 24자리가 아닙니다.")
+}
+
 var insertResult = sourceDb.movies.insertOne({
   _id: softDeleteTestId,
   title: softDeleteTestTitle,
@@ -619,12 +625,13 @@ if (!insertResult.acknowledged) {
 
 printjson({
   testId: softDeleteTestIdString,
+  testIdLength: softDeleteTestIdString.length,
   expectedTitle: softDeleteTestTitle,
   insertResult: insertResult
 })
 ```
 
-출력된 `testId`와 `expectedTitle`을 기록합니다. 이후 Athena 쿼리의 `<TEST_OBJECT_ID>`와 `<EXPECTED_TITLE>`에 사용합니다.
+출력된 `testId`와 `expectedTitle`을 기록합니다. `testIdLength`는 반드시 `24`여야 합니다. 이후 Athena 쿼리의 `<TEST_OBJECT_ID>`와 `<EXPECTED_TITLE>`에 사용하며 ObjectId의 앞이나 뒤 문자가 누락되지 않도록 주의합니다.
 
 #### Step 4. Delete 전 Iceberg 기준 상태 확인
 
@@ -637,7 +644,6 @@ SELECT
     year,
     runtime,
     "isDeleted",
-    "deletedAt",
     "operationType"
 FROM "mongodb_gluedb"."sample_mflix_movies_v2"
 WHERE "_id" = '<TEST_OBJECT_ID>';
@@ -651,7 +657,6 @@ title = <EXPECTED_TITLE>
 year = 2099
 runtime = 777
 isDeleted = false
-deletedAt = null
 operationType = insert
 ```
 
@@ -756,7 +761,131 @@ dlqMessageCount = Delete 전과 동일하며 정상적으로는 0
 
 #### Step 8. Athena에서 최종 Soft Delete 행 확인
 
-Iceberg Commit 후 다음 쿼리를 실행합니다.
+먼저 Iceberg Schema에 `deletedAt` 컬럼이 추가됐는지 확인합니다.
+
+```sql
+DESCRIBE "mongodb_gluedb"."sample_mflix_movies_v2";
+```
+
+Delete 이벤트가 Commit되기 전에는 `deletedAt` 컬럼이 아직 없을 수 있습니다. 이 경우 `deletedAt`을 제외한 다음 쿼리로 Delete 이벤트 반영 여부를 먼저 확인합니다.
+
+```sql
+SELECT
+    "_id",
+    title,
+    year,
+    runtime,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" = '<TEST_OBJECT_ID>';
+```
+
+`isDeleted=false`라면 Delete Commit을 기다린 후 `DESCRIBE`와 조회 쿼리를 다시 실행합니다. `isDeleted=true`인데도 `DESCRIBE`에 `deletedAt`이 없다면 아래의 Pipeline 수정 절차를 적용합니다.
+
+조회 결과가 0건이면 먼저 Athena에 입력한 ObjectId 길이를 확인합니다.
+
+```sql
+SELECT length('<TEST_OBJECT_ID>') AS object_id_length;
+```
+
+정상 값은 `24`입니다. 한 글자가 뒤에서 누락된 경우에는 Prefix 조회로 실제 값을 찾을 수 있습니다.
+
+```sql
+SELECT
+    "_id",
+    length("_id") AS id_length,
+    title,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" LIKE '<입력한 ObjectId Prefix>%';
+```
+
+테스트 코드가 생성한 고유 제목으로도 찾을 수 있습니다.
+
+```sql
+SELECT
+    "_id",
+    length("_id") AS id_length,
+    title,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE title LIKE 'ASP_SOFT_DELETE_%'
+ORDER BY title DESC
+LIMIT 20;
+```
+
+두 쿼리에서 행이 발견되면 반환된 정확한 24자리 `_id`로 최종 검증 쿼리를 다시 실행합니다.
+
+Prefix와 제목 조회에서도 결과가 없다면 Iceberg Snapshot 이력을 확인합니다.
+
+```sql
+SELECT *
+FROM "mongodb_gluedb"."sample_mflix_movies_v2$snapshots"
+ORDER BY committed_at DESC
+LIMIT 10;
+```
+
+Delete 직전 Snapshot ID를 선택해 과거 상태를 조회합니다.
+
+```sql
+SELECT
+    "_id",
+    title,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+FOR VERSION AS OF <DELETE_직전_SNAPSHOT_ID>
+WHERE "_id" LIKE '<입력한 ObjectId Prefix>%';
+```
+
+- 과거 Snapshot에는 있고 현재 테이블에는 없으면 Delete가 Iceberg 물리 삭제로 처리된 것입니다.
+- 과거 Snapshot에도 없으면 Insert가 Iceberg에 Commit되지 않았거나 다른 ObjectId/Table을 조회한 것입니다.
+- 현재 테이블에 한 건 남고 `isDeleted=true`이면 Soft Delete는 정상입니다.
+
+현재 Pipeline의 일반 문서 분기에 `deletedAt: null`이 있는지 확인합니다.
+
+```javascript
+var processorDefinition = sp.listStreamProcessors()
+  .find(item => item.name === "sp01")
+
+var pipelineOnly = processorDefinition.pipeline
+
+var replaceRootStage = pipelineOnly
+  .find(stage => stage.$replaceRoot)
+
+printjson(replaceRootStage)
+```
+
+현재 문서의 Pipeline 구조와 동일하다면 일반 문서 분기의 `deletedAt`을 제거합니다.
+
+```javascript
+delete replaceRootStage
+  .$replaceRoot
+  .newRoot
+  .$cond[2]
+  .$mergeObjects[1]
+  .deletedAt
+```
+
+Initial Sync가 `completed`인 것을 확인한 후 Processor를 수정합니다. 이 변경에서는 소스 체크포인트를 유지합니다.
+
+```javascript
+sp.sp01.stop()
+
+sp.sp01.modify(
+  pipelineOnly,
+  { resumeFromCheckpoint: true }
+)
+
+sp.sp01.start()
+```
+
+이후 새로운 테스트 문서를 Insert한 뒤 Delete 테스트를 다시 수행합니다. 실제 Date 값을 가진 최초 Delete 이벤트가 Commit되면 Iceberg Schema에 `deletedAt`이 `timestamp` 또는 `timestamp with time zone` 계열로 추가되어야 합니다.
+
+Schema에 컬럼이 확인되면 다음 최종 쿼리를 실행합니다.
 
 ```sql
 SELECT
@@ -849,15 +978,365 @@ DESCRIBE "mongodb_gluedb"."sample_mflix_movies_v2";
 | 결과 | 의미 | 확인할 항목 |
 | --- | --- | --- |
 | MongoDB `deletedCount=0` | 원본 테스트 문서가 없거나 ID가 다름 | `testId`, 대상 DB/Collection 확인 |
-| MongoDB에는 없고 Iceberg `row_count=0` | Iceberg에서도 물리 삭제됐거나 Insert가 반영되지 않음 | `$setStreamMeta`, Delete 전 기준 조회 확인 |
+| MongoDB에는 없고 Iceberg `row_count=0` | ObjectId 오입력, Iceberg 물리 삭제 또는 Insert 미반영 | ObjectId 24자리, Prefix/제목 조회, Delete 전 기준 조회 확인 |
 | Iceberg `row_count=1`, `isDeleted=false` | Delete 이벤트 미처리 또는 Commit 대기 중 | Processor 출력 건수, 상태, Glue Snapshot 재조회 |
 | Iceberg `row_count=1`, `isDeleted=true`, `deletedAt=null` | Delete 시간 변환 누락 | `$replaceRoot`의 `deletedAt: "$wallTime"` 확인 |
 | Iceberg `row_count>1` | CDC 키 또는 중복 처리 문제 | `mode: "cdc"`, `idFieldName: "_id"`, 체크포인트 확인 |
 | `title/year/runtime` 유실 | Delete Pre Image를 받지 못함 | Pre/Post Image 설정 및 보존 기간 확인 |
+| `COLUMN_NOT_FOUND: deletedat` | Delete Commit 전이거나 Initial Sync의 `null` 값으로 컬럼 타입을 추론하지 못함 | `DESCRIBE` 확인, 일반 문서의 `deletedAt: null` 제거 후 새 Delete 테스트 |
 | Processor `status=error` | 파이프라인 또는 외부 저장소 오류 | Processor 오류 메시지, S3/Glue/KMS 권한 확인 |
 | DLQ 증가 | 해당 이벤트 변환 또는 스키마 오류 | DLQ 문서의 `reason`과 원본 문서 확인 |
 
 Iceberg Commit은 비동기로 반영될 수 있습니다. 최종 쿼리가 처음에 `FAIL`이면 Processor가 정상 실행 중인지 확인하면서 일정 간격으로 다시 실행합니다. Processor 출력 건수가 증가했는데도 계속 `FAIL`이면 단순 지연이 아닌 파이프라인 또는 Iceberg Commit 문제로 판단합니다.
+
+### 11.4 Soft Delete 테스트 결과 집계
+
+테스트 제목으로 여러 문서를 만들었다면 목록의 일부 행만 보고 성공 여부를 판단하지 않습니다. 상태별 건수를 집계합니다.
+
+```sql
+SELECT
+    "isDeleted",
+    "operationType",
+    count(*) AS row_count
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE title LIKE 'ASP_SOFT_DELETE_%'
+GROUP BY "isDeleted", "operationType"
+ORDER BY "isDeleted", "operationType";
+```
+
+Soft Delete 테스트가 한 건 이상 성공했다면 최소한 다음 그룹이 존재해야 합니다.
+
+```text
+isDeleted = true
+operationType = delete
+row_count >= 1
+```
+
+중복 여부는 `_id`별로 확인합니다.
+
+```sql
+SELECT
+    "_id",
+    count(*) AS row_count
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE title LIKE 'ASP_SOFT_DELETE_%'
+GROUP BY "_id"
+HAVING count(*) <> 1;
+```
+
+정상 결과는 `0건`입니다. 결과가 있으면 해당 `_id`에 중복 또는 누락 문제가 있습니다.
+
+현재 확인된 결과는 다음과 같습니다.
+
+```text
+false / insert = 11건
+true / delete = 0건
+중복 _id = 4개
+각 중복 _id의 row_count = 2
+```
+
+따라서 현재 `sample_mflix_movies_v2`는 Soft Delete 검증 성공 상태가 아니며, 중복 없는 운영 기준 테이블로도 볼 수 없습니다. Processor가 중지된 상태에서 테스트 데이터를 변경했거나 동일 테이블에 `resumeFromCheckpoint=false` Initial Sync를 반복한 것이 유력한 원인입니다.
+
+### 11.5 Processor 실행 중 Soft Delete 재검증
+
+Checkpoint 테스트 전에 Processor가 실행 중인 상태에서 새로운 ObjectId로 Soft Delete를 다시 검증합니다. 기존 중복 ID는 사용하지 않습니다.
+
+#### Step 1. Processor 실행 상태 확인
+
+ASP Workspace에서 실행합니다.
+
+```javascript
+var liveStats = sp.sp01.stats({
+  options: { verbose: true }
+})
+
+printjson({
+  status: liveStats.stats.status,
+  outputMessageCount: liveStats.stats.outputMessageCount,
+  dlqMessageCount: liveStats.stats.dlqMessageCount
+})
+```
+
+`status=running`인지 확인합니다.
+
+#### Step 2. 실행 중 새로운 문서 Insert
+
+소스 Atlas 클러스터에서 실행합니다.
+
+```javascript
+var sourceDb = db.getSiblingDB("sample_mflix")
+var liveDeleteId = ObjectId()
+var liveDeleteTitle = "ASP_LIVE_DELETE_" + liveDeleteId.toHexString()
+
+sourceDb.movies.insertOne({
+  _id: liveDeleteId,
+  title: liveDeleteTitle,
+  year: NumberInt(2099),
+  runtime: NumberInt(888),
+  type: "movie"
+})
+
+printjson({
+  id: liveDeleteId.toHexString(),
+  title: liveDeleteTitle
+})
+```
+
+#### Step 3. Delete 전 Iceberg Insert 확인
+
+```sql
+SELECT
+    "_id",
+    title,
+    runtime,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" = '<LIVE_DELETE_ID>';
+```
+
+다음 결과가 확인된 후에만 Delete를 실행합니다.
+
+```text
+행 개수 = 1
+runtime = 888
+isDeleted = false
+operationType = insert
+```
+
+#### Step 4. Processor 실행 중 Delete
+
+소스 Atlas 클러스터에서 실행합니다.
+
+```javascript
+var deleteResult = sourceDb.movies.deleteOne({
+  _id: liveDeleteId
+})
+
+printjson(deleteResult)
+
+if (deleteResult.deletedCount !== 1) {
+  throw new Error("Delete 대상 문서가 정확히 한 건이 아닙니다.")
+}
+```
+
+#### Step 5. Iceberg 최종 상태 확인
+
+```sql
+SELECT
+    "_id",
+    title,
+    runtime,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" = '<LIVE_DELETE_ID>';
+```
+
+성공 조건:
+
+```text
+행 개수 = 1
+runtime = 888
+isDeleted = true
+operationType = delete
+```
+
+정확한 행 개수도 확인합니다.
+
+```sql
+SELECT count(*) AS row_count
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" = '<LIVE_DELETE_ID>';
+```
+
+결과 해석:
+
+- `row_count=1`, `true/delete`: Soft Delete 성공
+- `row_count=1`, `false/insert`: Delete 이벤트 미처리 또는 Commit 대기
+- `row_count=0`: Iceberg 물리 삭제 가능성, `$setStreamMeta` 확인 필요
+- `row_count>1`: 새로운 이벤트에서도 중복 발생, Checkpoint 테스트 중단
+
+Soft Delete가 성공하면 현재 `v2` 테이블의 기존 중복은 별도 데이터 품질 문제로 처리합니다. 가장 안전한 정리 방법은 새 `sample-mflix-v3/sample_mflix_movies_v3` 대상에 Initial Sync를 한 번만 수행하고, 같은 테이블에 `resumeFromCheckpoint=false` 재동기화를 반복하지 않는 것입니다.
+
+### 11.6 다음 권장 테스트: Checkpoint 재시작 복구
+
+기본 CRUD와 Soft Delete 다음에는 Processor가 중지된 동안 발생한 이벤트를 재시작 후 누락 및 중복 없이 처리하는지 검증합니다.
+
+이 테스트는 다음 세 문서를 사용합니다.
+
+| 문서 | Processor 중지 중 작업 | 재시작 후 기대 결과 |
+| --- | --- | --- |
+| A | Insert | 활성 행 한 건, `operationType=insert` |
+| B | Insert 후 Update | 최신 값의 활성 행 한 건, `operationType=update` |
+| C | Insert 후 Delete | Soft Delete 행 한 건, `operationType=delete` |
+
+#### Step 1. Initial Sync 완료와 현재 상태 확인
+
+ASP Workspace에서 실행합니다.
+
+```javascript
+sp.sp01.stats({
+  options: { verbose: true }
+}).stats.operatorStats[0].targetStats
+```
+
+`initialSync.status`가 `completed`인지 확인합니다.
+
+#### Step 2. Processor 중지
+
+```javascript
+sp.sp01.stop()
+
+sp.listStreamProcessors()
+  .find(item => item.name === "sp01")
+```
+
+`state=STOPPED`가 확인된 후 원본 데이터를 변경합니다.
+
+#### Step 3. 중지 중 테스트 이벤트 생성
+
+소스 Atlas 클러스터의 `mongosh`에서 실행합니다.
+
+```javascript
+var sourceDb = db.getSiblingDB("sample_mflix")
+var testRun = new Date().toISOString().replace(/[-:.TZ]/g, "")
+
+var restartInsertId = ObjectId()
+var restartUpdateId = ObjectId()
+var restartDeleteId = ObjectId()
+
+sourceDb.movies.insertMany([
+  {
+    _id: restartInsertId,
+    title: "ASP_RESTART_INSERT_" + testRun,
+    year: NumberInt(2099),
+    runtime: NumberInt(101),
+    type: "movie"
+  },
+  {
+    _id: restartUpdateId,
+    title: "ASP_RESTART_UPDATE_" + testRun,
+    year: NumberInt(2099),
+    runtime: NumberInt(201),
+    type: "movie"
+  },
+  {
+    _id: restartDeleteId,
+    title: "ASP_RESTART_DELETE_" + testRun,
+    year: NumberInt(2099),
+    runtime: NumberInt(301),
+    type: "movie"
+  }
+])
+
+sourceDb.movies.updateOne(
+  { _id: restartUpdateId },
+  {
+    $set: {
+      runtime: NumberInt(222),
+      plot: "updated while processor stopped"
+    }
+  }
+)
+
+sourceDb.movies.deleteOne({
+  _id: restartDeleteId
+})
+
+printjson({
+  testRun: testRun,
+  insertId: restartInsertId.toHexString(),
+  updateId: restartUpdateId.toHexString(),
+  deleteId: restartDeleteId.toHexString()
+})
+```
+
+출력된 세 ObjectId를 기록합니다.
+
+#### Step 4. 기존 Checkpoint로 Processor 재시작
+
+ASP Workspace에서 실행합니다.
+
+```javascript
+sp.sp01.start()
+```
+
+이 테스트에서는 `resumeFromCheckpoint=false` 또는 `clearCheckpoints=true`를 사용하면 안 됩니다. 기본 동작으로 마지막 Checkpoint부터 재개해야 중지 중 생성된 이벤트를 읽습니다.
+
+상태 확인:
+
+```javascript
+sp.sp01.stats({
+  options: { verbose: true }
+})
+```
+
+`stats.status=running`, `dlqMessageCount=0`인지 확인합니다.
+
+#### Step 5. Athena에서 세 문서 확인
+
+```sql
+SELECT
+    "_id",
+    title,
+    runtime,
+    "isDeleted",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" IN (
+    '<INSERT_ID>',
+    '<UPDATE_ID>',
+    '<DELETE_ID>'
+)
+ORDER BY "_id";
+```
+
+기대 결과:
+
+| ID | runtime | isDeleted | operationType |
+| --- | ---: | --- | --- |
+| `<INSERT_ID>` | `101` | `false` | `insert` |
+| `<UPDATE_ID>` | `222` | `false` | `update` |
+| `<DELETE_ID>` | `301` | `true` | `delete` |
+
+세 ID가 각각 한 행인지 확인합니다.
+
+```sql
+SELECT
+    "_id",
+    count(*) AS row_count
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" IN (
+    '<INSERT_ID>',
+    '<UPDATE_ID>',
+    '<DELETE_ID>'
+)
+GROUP BY "_id"
+ORDER BY "_id";
+```
+
+정상 결과는 세 ID 모두 `row_count=1`입니다.
+
+#### Step 6. Checkpoint 테스트 성공 조건
+
+- 세 문서가 모두 Iceberg에 존재합니다.
+- Update 문서의 `runtime`은 최종 값 `222`입니다.
+- Delete 문서는 물리 삭제되지 않고 `isDeleted=true`입니다.
+- 각 `_id`의 행 개수는 정확히 한 건입니다.
+- Processor는 `running` 상태입니다.
+- DLQ 건수는 증가하지 않습니다.
+
+### 11.7 이후 권장 테스트 순서
+
+Checkpoint 복구까지 성공하면 다음 순서로 운영 준비 테스트를 진행합니다.
+
+1. `replaceOne()` 이벤트가 기존 `_id` 행 한 건을 정상 교체하는지 검증
+2. 새로운 Scalar 필드 추가 시 Iceberg Schema Evolution 검증
+3. Atlas 현재 문서 수와 Iceberg `isDeleted=false` 행 수 대사
+4. 지원하지 않는 BSON 타입을 사용한 DLQ 동작 검증
+5. 여러 번의 빠른 Update 후 마지막 값만 남는지 순서 보장 검증
+6. Oplog Window 내 장시간 중지 후 Checkpoint 복구 검증
 
 ## 12. 최종 검증 결과
 
@@ -872,7 +1351,8 @@ Iceberg Commit은 비동기로 반영될 수 있습니다. 최종 쿼리가 처�
 | Initial Sync | 성공 |
 | Insert CDC | 성공 |
 | Update CDC | 성공 |
-| Delete Soft Delete | 성공 |
+| Delete Soft Delete | 재검증 필요 |
+| `_id` 중복 검증 | 실패: 4개 ID가 각 2건 |
 | Athena 조회 | 성공 |
 
 ## 13. 오류별 해결 내용
@@ -897,8 +1377,9 @@ Iceberg Commit은 비동기로 반영될 수 있습니다. 최종 쿼리가 처�
 - [x] `$iceberg.path` 후행 `/` 제거
 - [x] 새 Path와 Table로 재구축
 - [x] Initial Sync 완료 확인
-- [x] Insert/Update/Delete 테스트 완료
-- [x] Soft Delete 후 Iceberg 행 한 건 유지 확인
+- [ ] Processor 실행 중 Insert/Update/Delete 테스트 완료
+- [ ] Soft Delete 후 Iceberg 행 한 건 유지 확인
+- [ ] 중복 없는 새 Iceberg 테이블 검증
 - [x] Athena 조회 성공
 - [ ] Processor 실패 및 DLQ Alert 구성
 - [ ] Atlas와 Iceberg 활성 데이터 정기 수량 대사
