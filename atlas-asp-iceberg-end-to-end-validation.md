@@ -505,67 +505,359 @@ isDeleted = false
 operationType = update
 ```
 
-### 11.3 Delete와 Soft Delete
+### 11.3 Delete와 Soft Delete 상세 검증
+
+Delete 테스트는 다음 네 가지를 모두 확인해야 성공입니다.
+
+1. MongoDB 원본 문서가 실제로 삭제됩니다.
+2. Stream Processor가 실패하지 않고 Delete 이벤트를 출력합니다.
+3. Iceberg에는 동일한 `_id`의 행이 정확히 한 건 남습니다.
+4. 남은 행이 `isDeleted=true`, `operationType=delete`, `deletedAt IS NOT NULL` 상태입니다.
+
+테스트는 운영 데이터와 구분되는 새로운 ObjectId를 사용합니다. Soft Delete 행은 Iceberg에 의도적으로 남으므로 테스트 전용 테이블에서 수행하는 것을 권장합니다.
+
+#### Step 1. Processor와 대상 설정 확인
+
+ASP Workspace의 `mongosh`에서 실행합니다.
 
 ```javascript
-db.movies.deleteOne({ _id: testId })
+var spDefinition = sp.listStreamProcessors()
+  .find(item => item.name === "sp01")
+
+var sourceStage = spDefinition.pipeline
+  .find(stage => stage.$source)
+
+var icebergStage = spDefinition.pipeline
+  .find(stage => stage.$iceberg)
+
+var setStreamMetaStage = spDefinition.pipeline
+  .find(stage => stage.$setStreamMeta)
+
+printjson({
+  state: spDefinition.state,
+  source: sourceStage,
+  iceberg: icebergStage,
+  hasSetStreamMeta: Boolean(setStreamMetaStage)
+})
 ```
 
-MongoDB에서 물리 삭제를 확인합니다.
+다음 항목을 확인합니다.
+
+```text
+state = STARTED
+$source.initialSync.enable = true
+$source.config.fullDocumentBeforeChange = required
+$iceberg.bucket = sumi-asp-iceberg-bucket
+$iceberg.tableName = sample_mflix_movies_v2
+$iceberg.mode = cdc
+$iceberg.idFieldName = _id
+hasSetStreamMeta = true
+```
+
+#### Step 2. Pre/Post Image 확인
+
+이 단계부터는 ASP Workspace가 아닌 소스 Atlas 클러스터의 `mongosh`에서 실행합니다.
 
 ```javascript
-db.movies.findOne({ _id: testId })
+var sourceDb = db.getSiblingDB("sample_mflix")
+
+var collInfo = sourceDb
+  .getCollectionInfos({ name: "movies" })[0]
+
+printjson(collInfo.options.changeStreamPreAndPostImages)
+
+if (
+  !collInfo.options.changeStreamPreAndPostImages ||
+  collInfo.options.changeStreamPreAndPostImages.enabled !== true
+) {
+  throw new Error("movies 컬렉션의 Pre/Post Image가 활성화되지 않았습니다.")
+}
 ```
 
 기대 결과:
 
-```text
-null
+```javascript
+{
+  enabled: true
+}
 ```
 
-Athena에서 Iceberg Soft Delete 결과를 확인합니다.
+활성화되지 않았다면 테스트 전에 실행합니다.
+
+```javascript
+sourceDb.runCommand({
+  collMod: "movies",
+  changeStreamPreAndPostImages: {
+    enabled: true
+  }
+})
+```
+
+Pre/Post Image를 활성화하기 전에 생성된 Change Event에는 Pre Image가 없을 수 있습니다. 활성화 후 새로운 테스트 문서를 생성해야 합니다.
+
+#### Step 3. 독립적인 Delete 테스트 문서 생성
+
+소스 Atlas 클러스터의 동일한 `mongosh` 세션에서 실행합니다.
+
+```javascript
+var softDeleteTestId = ObjectId()
+var softDeleteTestIdString = softDeleteTestId.toHexString()
+var softDeleteTestTitle = "ASP_SOFT_DELETE_" + softDeleteTestIdString
+
+var insertResult = sourceDb.movies.insertOne({
+  _id: softDeleteTestId,
+  title: softDeleteTestTitle,
+  year: NumberInt(2099),
+  runtime: NumberInt(777),
+  plot: "ASP Iceberg soft delete verification",
+  type: "movie"
+})
+
+if (!insertResult.acknowledged) {
+  throw new Error("테스트 문서 Insert가 승인되지 않았습니다.")
+}
+
+printjson({
+  testId: softDeleteTestIdString,
+  expectedTitle: softDeleteTestTitle,
+  insertResult: insertResult
+})
+```
+
+출력된 `testId`와 `expectedTitle`을 기록합니다. 이후 Athena 쿼리의 `<TEST_OBJECT_ID>`와 `<EXPECTED_TITLE>`에 사용합니다.
+
+#### Step 4. Delete 전 Iceberg 기준 상태 확인
+
+Delete 전에 Insert가 Iceberg에 반영됐는지 Athena에서 확인합니다. Insert가 확인되기 전에 바로 삭제하면 Insert 실패와 Delete 실패를 구분하기 어렵습니다.
 
 ```sql
 SELECT
     "_id",
     title,
     year,
+    runtime,
     "isDeleted",
     "deletedAt",
     "operationType"
 FROM "mongodb_gluedb"."sample_mflix_movies_v2"
-WHERE "_id" = '<테스트 ObjectId>';
+WHERE "_id" = '<TEST_OBJECT_ID>';
+```
+
+Delete 전 기대 결과:
+
+```text
+행 개수 = 1
+title = <EXPECTED_TITLE>
+year = 2099
+runtime = 777
+isDeleted = false
+deletedAt = null
+operationType = insert
+```
+
+결과가 아직 없으면 잠시 기다린 후 같은 쿼리를 다시 실행합니다. Processor가 비동기로 Iceberg Snapshot을 Commit하므로 MongoDB Insert 직후에는 보이지 않을 수 있습니다.
+
+#### Step 5. Delete 전 Processor 상태 기록
+
+ASP Workspace의 `mongosh`에서 실행합니다.
+
+```javascript
+var beforeDeleteStats = sp.sp01.stats({
+  options: { verbose: true }
+})
+
+printjson({
+  status: beforeDeleteStats.stats.status,
+  outputMessageCount: beforeDeleteStats.stats.outputMessageCount,
+  dlqMessageCount: beforeDeleteStats.stats.dlqMessageCount
+})
+```
+
+`status`가 `running`이고 `dlqMessageCount`가 `0`인지 확인합니다. 운영 트래픽이 함께 처리되는 환경에서는 `outputMessageCount`의 정확한 증가량보다 삭제 후에도 값이 증가하고 Processor가 정상 상태를 유지하는지가 중요합니다.
+
+#### Step 6. MongoDB Delete 실행과 즉시 검증
+
+다시 소스 Atlas 클러스터의 `mongosh`에서 실행합니다. Step 3과 다른 세션이라면 기록한 ObjectId로 변수를 다시 만듭니다.
+
+```javascript
+// 새 세션에서만 실제 테스트 ObjectId로 다시 설정합니다.
+// var sourceDb = db.getSiblingDB("sample_mflix")
+// var softDeleteTestId = ObjectId("<TEST_OBJECT_ID>")
+
+var deleteRequestedAt = new Date()
+
+var deleteResult = sourceDb.movies.deleteOne({
+  _id: softDeleteTestId
+})
+
+if (deleteResult.deletedCount !== 1) {
+  throw new Error(
+    "Delete 대상이 한 건이 아닙니다. deletedCount=" +
+    deleteResult.deletedCount
+  )
+}
+
+var sourceDocumentAfterDelete = sourceDb.movies.findOne({
+  _id: softDeleteTestId
+})
+
+if (sourceDocumentAfterDelete !== null) {
+  throw new Error("MongoDB 원본 문서가 삭제되지 않았습니다.")
+}
+
+printjson({
+  testId: softDeleteTestId.toHexString(),
+  deleteRequestedAt: deleteRequestedAt,
+  deletedCount: deleteResult.deletedCount,
+  sourceDocumentAfterDelete: sourceDocumentAfterDelete
+})
+```
+
+기대 결과:
+
+```text
+deletedCount = 1
+sourceDocumentAfterDelete = null
+```
+
+여기까지는 MongoDB 원본 Delete 성공만 의미합니다. Iceberg Soft Delete 성공 여부는 다음 단계에서 별도로 확인해야 합니다.
+
+#### Step 7. Delete 후 Processor와 DLQ 확인
+
+ASP Workspace의 `mongosh`에서 실행합니다.
+
+```javascript
+var afterDeleteStats = sp.sp01.stats({
+  options: { verbose: true }
+})
+
+printjson({
+  status: afterDeleteStats.stats.status,
+  outputMessageCount: afterDeleteStats.stats.outputMessageCount,
+  dlqMessageCount: afterDeleteStats.stats.dlqMessageCount
+})
+```
+
+성공 조건:
+
+```text
+status = running
+outputMessageCount = Delete 전보다 증가
+dlqMessageCount = Delete 전과 동일하며 정상적으로는 0
+```
+
+`status=error`이거나 DLQ가 증가하면 다음 항목을 확인합니다.
+
+- `fullDocumentBeforeChange: "required"` 설정
+- `changeStreamPreAndPostImages.enabled=true` 설정
+- Pre Image 보존 기간
+- `$setStreamMeta`의 `stream.source.operationType` 변환
+- S3, Glue 또는 KMS 권한 오류
+
+#### Step 8. Athena에서 최종 Soft Delete 행 확인
+
+Iceberg Commit 후 다음 쿼리를 실행합니다.
+
+```sql
+SELECT
+    "_id",
+    title,
+    year,
+    runtime,
+    "isDeleted",
+    "deletedAt",
+    "operationType"
+FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+WHERE "_id" = '<TEST_OBJECT_ID>';
 ```
 
 최종 기대 결과:
 
 ```text
 행 개수 = 1
-title = ASP ICEBERG CDC TEST UPDATED
-year = 2027
+title = <EXPECTED_TITLE>
+year = 2099
+runtime = 777
 isDeleted = true
-deletedAt = 삭제 시각
+deletedAt = MongoDB 삭제 시각
 operationType = delete
 ```
 
-행 개수 확인:
+이 결과는 다음 동작을 증명합니다.
+
+- `title`, `year`, `runtime` 유지: `fullDocumentBeforeChange`가 정상적으로 전달됨
+- `isDeleted=true`: Delete 문서 변환 성공
+- `deletedAt` 존재: Delete 이벤트 시간이 기록됨
+- `operationType=delete`: 원본 작업 유형이 데이터에 보존됨
+- 행 개수 1: Iceberg에서 물리 삭제되지 않았고 중복도 발생하지 않음
+
+#### Step 9. Athena 자동 PASS/FAIL 판정
+
+다음 쿼리는 주요 조건을 한 번에 검사합니다. 두 Placeholder를 Step 3에서 기록한 값으로 바꿉니다.
 
 ```sql
+WITH target AS (
+    SELECT *
+    FROM "mongodb_gluedb"."sample_mflix_movies_v2"
+    WHERE "_id" = '<TEST_OBJECT_ID>'
+)
 SELECT
     count(*) AS row_count,
-    max("isDeleted") AS is_deleted
-FROM "mongodb_gluedb"."sample_mflix_movies_v2"
-WHERE "_id" = '<테스트 ObjectId>';
+    sum(CASE WHEN "isDeleted" = true THEN 1 ELSE 0 END)
+        AS soft_deleted_count,
+    sum(CASE WHEN "deletedAt" IS NOT NULL THEN 1 ELSE 0 END)
+        AS deleted_at_count,
+    sum(CASE WHEN "operationType" = 'delete' THEN 1 ELSE 0 END)
+        AS delete_operation_count,
+    sum(CASE WHEN title = '<EXPECTED_TITLE>' THEN 1 ELSE 0 END)
+        AS preserved_title_count,
+    sum(CASE WHEN year = 2099 AND runtime = 777 THEN 1 ELSE 0 END)
+        AS preserved_value_count,
+    CASE
+        WHEN count(*) = 1
+         AND sum(CASE WHEN "isDeleted" = true THEN 1 ELSE 0 END) = 1
+         AND sum(CASE WHEN "deletedAt" IS NOT NULL THEN 1 ELSE 0 END) = 1
+         AND sum(CASE WHEN "operationType" = 'delete' THEN 1 ELSE 0 END) = 1
+         AND sum(CASE WHEN title = '<EXPECTED_TITLE>' THEN 1 ELSE 0 END) = 1
+         AND sum(CASE WHEN year = 2099 AND runtime = 777 THEN 1 ELSE 0 END) = 1
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS test_result
+FROM target;
 ```
 
-성공 조건:
+정상 결과:
 
 ```text
 row_count = 1
-is_deleted = true
+soft_deleted_count = 1
+deleted_at_count = 1
+delete_operation_count = 1
+preserved_title_count = 1
+preserved_value_count = 1
+test_result = PASS
 ```
 
-Iceberg Commit은 비동기로 반영될 수 있으므로 즉시 조회되지 않으면 Processor 상태와 출력 건수를 확인한 후 다시 조회합니다.
+Athena 또는 Glue에서 컬럼명이 소문자로 정규화되어 있다면 먼저 다음 명령으로 실제 컬럼명을 확인하고 쿼리의 `isDeleted`, `deletedAt`, `operationType`을 각각 실제 이름으로 바꿉니다.
+
+```sql
+DESCRIBE "mongodb_gluedb"."sample_mflix_movies_v2";
+```
+
+#### Step 10. 실패 결과 해석
+
+| 결과 | 의미 | 확인할 항목 |
+| --- | --- | --- |
+| MongoDB `deletedCount=0` | 원본 테스트 문서가 없거나 ID가 다름 | `testId`, 대상 DB/Collection 확인 |
+| MongoDB에는 없고 Iceberg `row_count=0` | Iceberg에서도 물리 삭제됐거나 Insert가 반영되지 않음 | `$setStreamMeta`, Delete 전 기준 조회 확인 |
+| Iceberg `row_count=1`, `isDeleted=false` | Delete 이벤트 미처리 또는 Commit 대기 중 | Processor 출력 건수, 상태, Glue Snapshot 재조회 |
+| Iceberg `row_count=1`, `isDeleted=true`, `deletedAt=null` | Delete 시간 변환 누락 | `$replaceRoot`의 `deletedAt: "$wallTime"` 확인 |
+| Iceberg `row_count>1` | CDC 키 또는 중복 처리 문제 | `mode: "cdc"`, `idFieldName: "_id"`, 체크포인트 확인 |
+| `title/year/runtime` 유실 | Delete Pre Image를 받지 못함 | Pre/Post Image 설정 및 보존 기간 확인 |
+| Processor `status=error` | 파이프라인 또는 외부 저장소 오류 | Processor 오류 메시지, S3/Glue/KMS 권한 확인 |
+| DLQ 증가 | 해당 이벤트 변환 또는 스키마 오류 | DLQ 문서의 `reason`과 원본 문서 확인 |
+
+Iceberg Commit은 비동기로 반영될 수 있습니다. 최종 쿼리가 처음에 `FAIL`이면 Processor가 정상 실행 중인지 확인하면서 일정 간격으로 다시 실행합니다. Processor 출력 건수가 증가했는데도 계속 `FAIL`이면 단순 지연이 아닌 파이프라인 또는 Iceberg Commit 문제로 판단합니다.
 
 ## 12. 최종 검증 결과
 
