@@ -113,20 +113,14 @@ Amazon Athena
 - Object Ownership: Bucket owner enforced
 - 기본 암호화: SSE-S3
 - Object Lock: 테스트에서는 비활성화
-- 버킷 이름에 점(`.`)을 사용하지 않음
+- iceberg 로 연경할 경우 **버킷 이름에 점(`.`)을 사용하지 않음**
 
-점이 포함된 기존 버킷에서는 `$emit`이 성공해도 Iceberg Metadata 파일 생성이 실패했습니다.
+참고로, 점이 포함된 기존 버킷에서는 `$emit`이 성공해도 Iceberg Metadata 파일 생성이 실패했습니다.
 
-```text
-사용하지 않음: sumi.bucket01-979559056307-ap-northeast-2-an
-최종 사용:    sumi-asp-iceberg-bucket
-```
-
-Iceberg가 관리하는 Prefix에는 일반적인 S3 Lifecycle 삭제 정책을 임의로 적용하지 않습니다. Metadata, Manifest 또는 Data 파일을 S3 Lifecycle이 직접 삭제하면 테이블이 손상될 수 있습니다.
 
 ### 5.2 S3 암호화
 
-SSE-S3를 사용하면 별도의 KMS 권한이 필요하지 않습니다.
+SSE-S3를 사용하면 별도의 KMS 권한이 필요하지 않습니다. 데모용이라 저는 SSE-S3 사용했으며 연결에 문제없었습니다.
 
 SSE-KMS를 사용한다면 IAM Policy와 KMS Key Policy에 다음 권한이 추가로 필요합니다.
 
@@ -197,10 +191,7 @@ Atlas Unified AWS Access에 등록한 IAM Role에 다음 Permission Policy를 �
 확인 사항:
 
 - Atlas가 사용하는 IAM Role에 이 정책이 연결되어야 합니다.
-- AWS Console 사용자에게 부여된 권한은 ASP Runtime에 전달되지 않습니다.
-- Bucket Policy 또는 Organizations SCP에 명시적 `Deny`가 없어야 합니다.
-- Lake Formation을 사용하면 Glue IAM 권한 외에 별도 Grant가 필요할 수 있습니다.
-- Trust Policy에는 Atlas가 제공한 Principal, External ID와 `sts:AssumeRole`이 있어야 합니다.
+- Role 관련은 각사의 AWS IAM을 확인하셔야 합니다.
 
 ## 7. Atlas 연결 설정
 
