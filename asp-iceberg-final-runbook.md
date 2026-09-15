@@ -9,7 +9,6 @@
 1. **Mock 테스트**: 실제 Atlas Change Stream을 사용하지 않고 합성 문서로 S3 연결과 Iceberg/Glue 생성을 검증합니다.
 2. **전체 테스트**: 실제 `sample_mflix.movies` Change Stream으로 Initial Sync, Insert, Update, Delete, Soft Delete와 Checkpoint 복구를 검증합니다.
 
-이 문서는 시행착오가 있었던 `v2`가 아니라 최종 검증 대상인 `v3`를 기준으로 합니다.
 
 ## 2. 최종 검증 결과
 
