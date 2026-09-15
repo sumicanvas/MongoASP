@@ -102,6 +102,7 @@ Amazon Athena
 ## 5. AWS S3 설정
 
 ### 5.1 버킷 생성 기준
+<img width="452" height="305" alt="image" src="https://github.com/user-attachments/assets/b6c8f4dd-4b08-47cc-a521-29bd50c19ba1" />
 
 다음 설정을 사용합니다.
 
